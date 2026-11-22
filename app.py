@@ -26,9 +26,9 @@ bot_status = {
 bot_config = {
     "session_id": "",
     "proxy": "",
-    "thread_id": "",
+    "group_target": "",
     "message_text": "",
-    "msg_delay": 2.0,
+    "msg_delay": 0.0005,
     "group_title": "",
     "meta_delay": 5.0,
     "protect_title": True,
@@ -71,27 +71,27 @@ HTML_TEMPLATE = """
       <label>Session ID Instagram</label>
       <input type="password" name="session_id" required placeholder="sessionid..." />
 
-      <label>Proxy (opțional, ex. http://user:pass@ip:port)</label>
+      <label>Proxy (opțional, ex. ip:port:user:pass sau http://user:pass@ip:port)</label>
       <input type="text" name="proxy" placeholder="" />
 
-      <label>Thread ID grup</label>
-      <input type="text" name="thread_id" required placeholder="ex. 3402823668417103009..." />
+      <label>Nume grup (sau Thread ID)</label>
+      <input type="text" name="group_target" required placeholder="Numele exact al grupului..." />
 
       <label>Mesaj automat</label>
       <textarea name="message_text" rows="2" placeholder="Textul trimis în grup..."></textarea>
 
       <div class="row">
         <div>
-          <label>Delay mesaje (sec, min 1.0)</label>
-          <input type="number" step="0.1" min="1.0" name="msg_delay" value="2.0" />
+          <label>Delay mesaje (sec, min 0.0005 = 0.5 ms)</label>
+          <input type="text" name="msg_delay" value="0.0005" />
         </div>
         <div>
           <label>Delay nume/poză (1–120 sec)</label>
-          <input type="number" step="0.5" min="1" max="120" name="meta_delay" value="5.0" />
+          <input type="text" name="meta_delay" value="5.0" />
         </div>
       </div>
 
-      <label>Nume grup dorit</label>
+      <label>Nume grup dorit (dacă lași gol, îl păstrează pe cel de sus)</label>
       <input type="text" name="group_title" placeholder="Numele grupului..." />
 
       <label>Poză grup (opțional, se convertește automat în JPG 800x800)</label>
@@ -148,12 +148,58 @@ HTML_TEMPLATE = """
 """
 
 
+def normalize_proxy(proxy: str) -> str:
+    p = (proxy or "").strip()
+    if not p:
+        return ""
+    if "://" in p:
+        return p
+    parts = p.split(":")
+    if len(parts) == 4:
+        ip, port, user, pwd = parts
+        return f"http://{user}:{pwd}@{ip}:{port}"
+    return f"http://{p}"
+
+
+def parse_float_safe(value, default_val: float, min_val: float, max_val: float) -> float:
+    try:
+        cleaned = str(value or "").replace(",", ".").strip()
+        num = float(cleaned)
+    except ValueError:
+        num = default_val
+    return min(max_val, max(min_val, num))
+
+
 def build_client(session_id: str, proxy: str) -> Client:
     cl = Client()
-    if proxy:
-        cl.set_proxy(proxy)
+    formatted_proxy = normalize_proxy(proxy)
+    if formatted_proxy:
+        cl.set_proxy(formatted_proxy)
     cl.login_by_sessionid(session_id)
     return cl
+
+
+def resolve_thread_id(cl: Client, group_target: str) -> int:
+    target = (group_target or "").strip()
+    if not target:
+        raise ValueError("Nu ai introdus numele sau ID-ul grupului.")
+    if target.isdigit():
+        return int(target)
+
+    threads = cl.direct_threads(amount=30)
+    target_lower = target.lower()
+
+    for t in threads:
+        title = (getattr(t, "thread_title", None) or getattr(t, "title", None) or "").strip()
+        if title.lower() == target_lower:
+            return int(t.id)
+
+    for t in threads:
+        title = (getattr(t, "thread_title", None) or getattr(t, "title", None) or "").strip()
+        if target_lower in title.lower():
+            return int(t.id)
+
+    raise ValueError(f"Nu am găsit niciun grup cu numele '{target}' în ultimele 30 conversații.")
 
 
 def save_processed_photo(file_storage) -> str:
@@ -165,7 +211,7 @@ def save_processed_photo(file_storage) -> str:
     return GROUP_PHOTO_PATH
 
 
-def set_group_photo_compat(cl: Client, thread_id: str, photo_path: str) -> None:
+def set_group_photo_compat(cl: Client, thread_id: int, photo_path: str) -> None:
     if hasattr(cl, "direct_thread_update_photo"):
         cl.direct_thread_update_photo(thread_id, photo_path)
         return
@@ -175,7 +221,7 @@ def set_group_photo_compat(cl: Client, thread_id: str, photo_path: str) -> None:
     raise RuntimeError("Metoda de schimbare poză grup nu este disponibilă în această versiune instagrapi.")
 
 
-def set_group_title_compat(cl: Client, thread_id: str, title: str) -> None:
+def set_group_title_compat(cl: Client, thread_id: int, title: str) -> None:
     if hasattr(cl, "direct_thread_update_title"):
         cl.direct_thread_update_title(thread_id, title)
         return
@@ -185,7 +231,7 @@ def set_group_title_compat(cl: Client, thread_id: str, title: str) -> None:
     raise RuntimeError("Metoda de schimbare nume grup nu este disponibilă în această versiune instagrapi.")
 
 
-def spam_worker(cfg: dict) -> None:
+def spam_worker(cfg: dict, thread_id: int) -> None:
     if not cfg["message_text"].strip():
         return
     try:
@@ -195,13 +241,12 @@ def spam_worker(cfg: dict) -> None:
             bot_status["last_error"] = f"Eroare login mesaje: {exc}"
         return
 
-    delay = max(1.0, float(cfg["msg_delay"]))
-    thread_id = cfg["thread_id"].strip()
+    delay = cfg["msg_delay"]
     text = cfg["message_text"]
 
     while not stop_event.is_set():
         try:
-            cl.direct_send(text, thread_ids=[int(thread_id)])
+            cl.direct_send(text, thread_ids=[thread_id])
             with state_lock:
                 bot_status["msg_count"] += 1
                 bot_status["last_action"] = f"Mesaj trimis (#{bot_status['msg_count']})"
@@ -213,7 +258,7 @@ def spam_worker(cfg: dict) -> None:
             break
 
 
-def group_meta_worker(cfg: dict) -> None:
+def group_meta_worker(cfg: dict, thread_id: int) -> None:
     if not cfg["protect_title"] and not cfg["protect_photo"]:
         return
     try:
@@ -223,14 +268,16 @@ def group_meta_worker(cfg: dict) -> None:
             bot_status["last_error"] = f"Eroare login grup: {exc}"
         return
 
-    delay = min(120.0, max(1.0, float(cfg["meta_delay"])))
-    thread_id = cfg["thread_id"].strip()
-    desired_title = cfg["group_title"].strip()
+    delay = cfg["meta_delay"]
+    desired_title = (
+        cfg["group_title"].strip()
+        or (cfg["group_target"].strip() if not cfg["group_target"].strip().isdigit() else "")
+    )
 
     while not stop_event.is_set():
         try:
-            thread = cl.direct_thread(int(thread_id))
-            current_title = getattr(thread, "title", "") or ""
+            thread = cl.direct_thread(thread_id)
+            current_title = getattr(thread, "thread_title", None) or getattr(thread, "title", None) or ""
 
             if cfg["protect_title"] and desired_title and current_title != desired_title:
                 set_group_title_compat(cl, thread_id, desired_title)
@@ -254,14 +301,26 @@ def group_meta_worker(cfg: dict) -> None:
 
 
 def controller_loop(cfg: dict) -> None:
+    try:
+        lookup_client = build_client(cfg["session_id"], cfg["proxy"])
+        thread_id = resolve_thread_id(lookup_client, cfg["group_target"])
+        with state_lock:
+            bot_status["last_action"] = f"Grup găsit (ID: {thread_id})"
+    except Exception as exc:
+        with state_lock:
+            bot_status["running"] = False
+            bot_status["last_error"] = f"Eroare găsire grup: {exc}"
+            bot_status["last_action"] = "Oprit"
+        return
+
     threads = []
     if cfg["message_text"].strip():
-        t_msg = threading.Thread(target=spam_worker, args=(cfg,), daemon=True)
+        t_msg = threading.Thread(target=spam_worker, args=(cfg, thread_id), daemon=True)
         t_msg.start()
         threads.append(t_msg)
 
     if cfg["protect_title"] or cfg["protect_photo"]:
-        t_meta = threading.Thread(target=group_meta_worker, args=(cfg,), daemon=True)
+        t_meta = threading.Thread(target=group_meta_worker, args=(cfg, thread_id), daemon=True)
         t_meta.start()
         threads.append(t_meta)
 
@@ -290,9 +349,9 @@ def status():
 @app.route("/start", methods=["POST"])
 def start():
     session_id = (request.form.get("session_id") or "").strip()
-    thread_id = (request.form.get("thread_id") or "").strip()
-    if not session_id or not thread_id:
-        return jsonify({"error": "Session ID și Thread ID sunt obligatorii."}), 400
+    group_target = (request.form.get("group_target") or "").strip()
+    if not session_id or not group_target:
+        return jsonify({"error": "Session ID și numele/ID-ul grupului sunt obligatorii."}), 400
 
     photo_file = request.files.get("group_photo")
     photo_saved = False
@@ -311,11 +370,11 @@ def start():
         bot_config.update({
             "session_id": session_id,
             "proxy": (request.form.get("proxy") or "").strip(),
-            "thread_id": thread_id,
+            "group_target": group_target,
             "message_text": request.form.get("message_text") or "",
-            "msg_delay": max(1.0, float(request.form.get("msg_delay") or 2.0)),
+            "msg_delay": parse_float_safe(request.form.get("msg_delay"), 0.0005, 0.0005, 3600.0),
             "group_title": (request.form.get("group_title") or "").strip(),
-            "meta_delay": min(120.0, max(1.0, float(request.form.get("meta_delay") or 5.0))),
+            "meta_delay": parse_float_safe(request.form.get("meta_delay"), 5.0, 1.0, 120.0),
             "protect_title": bool(request.form.get("protect_title")),
             "protect_photo": protect_photo,
         })
@@ -325,7 +384,7 @@ def start():
         bot_status["last_error"] = ""
         bot_status["msg_count"] = 0
         bot_status["meta_checks"] = 0
-        bot_status["last_action"] = "Pornit"
+        bot_status["last_action"] = "Se caută grupul..."
 
         cfg_copy = dict(bot_config)
 
