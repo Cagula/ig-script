@@ -18,10 +18,15 @@ DEFAULT_UA = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 )
 
+WEB_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
+)
+
 state_lock = threading.Lock()
 stop_event = threading.Event()
 msg_pause_event = threading.Event()
-msg_pause_event.set()  # setat = trimiterea mesajelor e activă, clear = pusă pe pauză prin .stop
+msg_pause_event.set()
 
 bot_status = {
     "running": False,
@@ -244,8 +249,48 @@ def set_group_title_compat(cl: Client, thread_id: int, title: str) -> None:
     raise RuntimeError("Metoda de schimbare nume grup nu este disponibilă în această versiune instagrapi.")
 
 
+def send_web_broadcast(cl: Client, thread_id: int, text: str) -> None:
+    cookies = getattr(cl, "cookie_dict", {}) or {}
+    csrf = cookies.get("csrftoken") or getattr(cl, "csrftoken", "") or ""
+    session_http = getattr(cl, "private", None)
+    if session_http is None or not hasattr(session_http, "post"):
+        raise RuntimeError("Sesiunea HTTP internă nu este disponibilă.")
+
+    headers = {
+        "User-Agent": WEB_UA,
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/direct/inbox/",
+        "Origin": "https://www.instagram.com",
+    }
+    if csrf:
+        headers["X-CSRFToken"] = csrf
+
+    payload = {
+        "action": "send_item",
+        "client_context": str(uuid.uuid4().int)[:19],
+        "thread_ids": f"[{thread_id}]",
+        "text": text,
+    }
+
+    resp = session_http.post(
+        "https://i.instagram.com/api/v1/direct_v2/threads/broadcast/text/",
+        data=payload,
+        headers=headers,
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(resp.text)
+
+
 def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
     errors = []
+
+    try:
+        send_web_broadcast(cl, thread_id, text)
+        return "web_broadcast"
+    except Exception as exc:
+        errors.append(f"web_broadcast: {exc}")
 
     try:
         cl.direct_send(text, thread_ids=[thread_id])
