@@ -1,1 +1,1 @@
-# ig-script
+# instagram-bot
