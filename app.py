@@ -2,6 +2,7 @@ import io
 import os
 import threading
 import time
+import uuid
 from flask import Flask, request, jsonify, render_template_string
 from instagrapi import Client
 from PIL import Image
@@ -28,7 +29,7 @@ bot_config = {
     "proxy": "",
     "group_target": "",
     "message_text": "",
-    "msg_delay": 0.1,
+    "msg_delay": 4.0,
     "group_title": "",
     "meta_delay": 5.0,
     "protect_title": True,
@@ -82,8 +83,8 @@ HTML_TEMPLATE = """
 
       <div class="row">
         <div>
-          <label>Delay mesaje (sec, min 0.1)</label>
-          <input type="text" name="msg_delay" value="0.1" />
+          <label>Delay mesaje (sec, min 4.0)</label>
+          <input type="text" name="msg_delay" value="4.0" />
         </div>
         <div>
           <label>Delay nume/poză (1–120 sec)</label>
@@ -231,6 +232,64 @@ def set_group_title_compat(cl: Client, thread_id: int, title: str) -> None:
     raise RuntimeError("Metoda de schimbare nume grup nu este disponibilă în această versiune instagrapi.")
 
 
+def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
+    errors = []
+
+    # 1. direct_send standard
+    try:
+        cl.direct_send(text, thread_ids=[thread_id])
+        return "direct_send"
+    except Exception as exc:
+        errors.append(f"direct_send: {exc}")
+
+    # 2. direct_answer (dacă există în versiunea curentă)
+    if hasattr(cl, "direct_answer"):
+        try:
+            cl.direct_answer(thread_id, text)
+            return "direct_answer"
+        except Exception as exc:
+            errors.append(f"direct_answer: {exc}")
+
+    # 3. private_request broadcast/text cu client_context nou
+    client_ctx = str(uuid.uuid4().int)[:19]
+    try:
+        cl.private_request(
+            "direct_v2/threads/broadcast/text/",
+            data={
+                "action": "send_item",
+                "is_shh_mode": "0",
+                "send_attribution": "inbox",
+                "client_context": client_ctx,
+                "thread_ids": f"[{thread_id}]",
+                "text": text,
+                "_uuid": getattr(cl, "uuid", str(uuid.uuid4())),
+                "_csrftoken": getattr(cl, "csrftoken", "") or cl.cookie_dict.get("csrftoken", ""),
+            },
+        )
+        return "private_broadcast_text"
+    except Exception as exc:
+        errors.append(f"broadcast_text: {exc}")
+
+    # 4. private_request cu thread_id singular
+    try:
+        cl.private_request(
+            "direct_v2/threads/broadcast/text/",
+            data={
+                "action": "send_item",
+                "client_context": str(uuid.uuid4().int)[:19],
+                "thread_id": str(thread_id),
+                "text": text,
+                "_uuid": getattr(cl, "uuid", str(uuid.uuid4())),
+                "_csrftoken": getattr(cl, "csrftoken", "") or cl.cookie_dict.get("csrftoken", ""),
+            },
+        )
+        return "private_broadcast_single"
+    except Exception as exc:
+        errors.append(f"broadcast_single: {exc}")
+
+    raise RuntimeError(" | ".join(errors))
+
+
 def spam_worker(cfg: dict, thread_id: int) -> None:
     if not cfg["message_text"].strip():
         return
@@ -241,20 +300,22 @@ def spam_worker(cfg: dict, thread_id: int) -> None:
             bot_status["last_error"] = f"Eroare login mesaje: {exc}"
         return
 
-    delay = cfg["msg_delay"]
+    base_delay = cfg["msg_delay"]
     text = cfg["message_text"]
 
     while not stop_event.is_set():
+        current_wait = base_delay
         try:
-            cl.direct_send(text, thread_ids=[thread_id])
+            method_used = send_message_cascade(cl, thread_id, text)
             with state_lock:
                 bot_status["msg_count"] += 1
-                bot_status["last_action"] = f"Mesaj trimis (#{bot_status['msg_count']})"
+                bot_status["last_action"] = f"Mesaj trimis (#{bot_status['msg_count']}) via {method_used}"
                 bot_status["last_error"] = ""
         except Exception as exc:
+            current_wait = max(base_delay, 12.0)
             with state_lock:
                 bot_status["last_error"] = f"Eroare mesaj: {exc}"
-        if stop_event.wait(delay):
+        if stop_event.wait(current_wait):
             break
 
 
@@ -372,7 +433,7 @@ def start():
             "proxy": (request.form.get("proxy") or "").strip(),
             "group_target": group_target,
             "message_text": request.form.get("message_text") or "",
-            "msg_delay": parse_float_safe(request.form.get("msg_delay"), 0.1, 0.1, 3600.0),
+            "msg_delay": parse_float_safe(request.form.get("msg_delay"), 4.0, 4.0, 3600.0),
             "group_title": (request.form.get("group_title") or "").strip(),
             "meta_delay": parse_float_safe(request.form.get("meta_delay"), 5.0, 1.0, 120.0),
             "protect_title": bool(request.form.get("protect_title")),
