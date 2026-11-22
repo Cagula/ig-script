@@ -28,7 +28,7 @@ bot_config = {
     "proxy": "",
     "group_target": "",
     "message_text": "",
-    "msg_delay": 0.0005,
+    "msg_delay": 0.1,
     "group_title": "",
     "meta_delay": 5.0,
     "protect_title": True,
@@ -82,8 +82,8 @@ HTML_TEMPLATE = """
 
       <div class="row">
         <div>
-          <label>Delay mesaje (sec, min 0.0005 = 0.5 ms)</label>
-          <input type="text" name="msg_delay" value="0.0005" />
+          <label>Delay mesaje (sec, min 0.1)</label>
+          <input type="text" name="msg_delay" value="0.1" />
         </div>
         <div>
           <label>Delay nume/poză (1–120 sec)</label>
@@ -372,7 +372,7 @@ def start():
             "proxy": (request.form.get("proxy") or "").strip(),
             "group_target": group_target,
             "message_text": request.form.get("message_text") or "",
-            "msg_delay": parse_float_safe(request.form.get("msg_delay"), 0.0005, 0.0005, 3600.0),
+            "msg_delay": parse_float_safe(request.form.get("msg_delay"), 0.1, 0.1, 3600.0),
             "group_title": (request.form.get("group_title") or "").strip(),
             "meta_delay": parse_float_safe(request.form.get("meta_delay"), 5.0, 1.0, 120.0),
             "protect_title": bool(request.form.get("protect_title")),
