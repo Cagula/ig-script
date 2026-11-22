@@ -13,8 +13,15 @@ UPLOAD_DIR = "/tmp/group_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 GROUP_PHOTO_PATH = os.path.join(UPLOAD_DIR, "group_avatar.jpg")
 
+DEFAULT_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+)
+
 state_lock = threading.Lock()
 stop_event = threading.Event()
+msg_pause_event = threading.Event()
+msg_pause_event.set()  # setat = trimiterea mesajelor e activă, clear = pusă pe pauză prin .stop
 
 bot_status = {
     "running": False,
@@ -62,6 +69,7 @@ HTML_TEMPLATE = """
     .status-box { margin-top: 14px; padding: 10px; background: #131313; border-radius: 7px; font-size: 13px; line-height: 1.5; }
     .badge-on { color: #48bb78; font-weight: bold; }
     .badge-off { color: #f56565; font-weight: bold; }
+    .hint { font-size: 12px; color: #9ca3af; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -107,6 +115,7 @@ HTML_TEMPLATE = """
         <button type="button" class="btn-start" onclick="startBot()">START</button>
         <button type="button" class="btn-stop" onclick="stopBot()">STOP</button>
       </div>
+      <div class="hint">Comenzi în grup când botul rulează: <b>.start 4</b> (pornește/setează delay mesaje) și <b>.stop</b> (pune mesajele pe pauză).</div>
     </form>
 
     <div class="status-box" id="statusBox">Se încarcă statusul...</div>
@@ -173,10 +182,13 @@ def parse_float_safe(value, default_val: float, min_val: float, max_val: float) 
 
 def build_client(session_id: str, proxy: str) -> Client:
     cl = Client()
+    cl.set_user_agent(DEFAULT_UA)
     formatted_proxy = normalize_proxy(proxy)
     if formatted_proxy:
         cl.set_proxy(formatted_proxy)
     cl.login_by_sessionid(session_id)
+    if hasattr(cl, "private") and getattr(cl.private, "headers", None) is not None:
+        cl.private.headers["User-Agent"] = DEFAULT_UA
     return cl
 
 
@@ -235,14 +247,12 @@ def set_group_title_compat(cl: Client, thread_id: int, title: str) -> None:
 def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
     errors = []
 
-    # 1. direct_send standard
     try:
         cl.direct_send(text, thread_ids=[thread_id])
         return "direct_send"
     except Exception as exc:
         errors.append(f"direct_send: {exc}")
 
-    # 2. direct_answer (dacă există în versiunea curentă)
     if hasattr(cl, "direct_answer"):
         try:
             cl.direct_answer(thread_id, text)
@@ -250,7 +260,12 @@ def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
         except Exception as exc:
             errors.append(f"direct_answer: {exc}")
 
-    # 3. private_request broadcast/text cu client_context nou
+    csrf = ""
+    try:
+        csrf = getattr(cl, "csrftoken", "") or cl.cookie_dict.get("csrftoken", "")
+    except Exception:
+        csrf = ""
+
     client_ctx = str(uuid.uuid4().int)[:19]
     try:
         cl.private_request(
@@ -263,14 +278,13 @@ def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
                 "thread_ids": f"[{thread_id}]",
                 "text": text,
                 "_uuid": getattr(cl, "uuid", str(uuid.uuid4())),
-                "_csrftoken": getattr(cl, "csrftoken", "") or cl.cookie_dict.get("csrftoken", ""),
+                "_csrftoken": csrf,
             },
         )
         return "private_broadcast_text"
     except Exception as exc:
         errors.append(f"broadcast_text: {exc}")
 
-    # 4. private_request cu thread_id singular
     try:
         cl.private_request(
             "direct_v2/threads/broadcast/text/",
@@ -280,7 +294,7 @@ def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
                 "thread_id": str(thread_id),
                 "text": text,
                 "_uuid": getattr(cl, "uuid", str(uuid.uuid4())),
-                "_csrftoken": getattr(cl, "csrftoken", "") or cl.cookie_dict.get("csrftoken", ""),
+                "_csrftoken": csrf,
             },
         )
         return "private_broadcast_single"
@@ -288,6 +302,40 @@ def send_message_cascade(cl: Client, thread_id: int, text: str) -> str:
         errors.append(f"broadcast_single: {exc}")
 
     raise RuntimeError(" | ".join(errors))
+
+
+def process_chat_commands(cl: Client, thread_id: int, seen_msg_ids: set) -> None:
+    try:
+        msgs = cl.direct_messages(thread_id, amount=5)
+    except Exception:
+        return
+
+    for m in reversed(msgs):
+        msg_id = str(getattr(m, "id", "") or "")
+        if not msg_id or msg_id in seen_msg_ids:
+            continue
+        seen_msg_ids.add(msg_id)
+
+        body = (getattr(m, "text", None) or "").strip().lower()
+        if not body:
+            continue
+
+        if body == ".stop":
+            msg_pause_event.clear()
+            with state_lock:
+                bot_status["last_action"] = "Comandă .stop primită din grup (mesaje pe pauză)"
+        elif body.startswith(".start"):
+            parts = body.split()
+            if len(parts) >= 2:
+                new_delay = parse_float_safe(parts[1], bot_config["msg_delay"], 4.0, 3600.0)
+                with state_lock:
+                    bot_config["msg_delay"] = new_delay
+                bot_status_action = f"Comandă .start primită (delay {new_delay}s)"
+            else:
+                bot_status_action = "Comandă .start primită din grup"
+            msg_pause_event.set()
+            with state_lock:
+                bot_status["last_action"] = bot_status_action
 
 
 def spam_worker(cfg: dict, thread_id: int) -> None:
@@ -300,10 +348,20 @@ def spam_worker(cfg: dict, thread_id: int) -> None:
             bot_status["last_error"] = f"Eroare login mesaje: {exc}"
         return
 
-    base_delay = cfg["msg_delay"]
     text = cfg["message_text"]
+    seen_msg_ids = set()
 
     while not stop_event.is_set():
+        process_chat_commands(cl, thread_id, seen_msg_ids)
+
+        if not msg_pause_event.is_set():
+            if stop_event.wait(1.0):
+                break
+            continue
+
+        with state_lock:
+            base_delay = bot_config["msg_delay"]
+
         current_wait = base_delay
         try:
             method_used = send_message_cascade(cl, thread_id, text)
@@ -315,6 +373,7 @@ def spam_worker(cfg: dict, thread_id: int) -> None:
             current_wait = max(base_delay, 12.0)
             with state_lock:
                 bot_status["last_error"] = f"Eroare mesaj: {exc}"
+
         if stop_event.wait(current_wait):
             break
 
@@ -440,6 +499,7 @@ def start():
             "protect_photo": protect_photo,
         })
 
+        msg_pause_event.set()
         stop_event.clear()
         bot_status["running"] = True
         bot_status["last_error"] = ""
@@ -456,6 +516,7 @@ def start():
 @app.route("/stop", methods=["POST"])
 def stop():
     stop_event.set()
+    msg_pause_event.set()
     with state_lock:
         bot_status["running"] = False
         bot_status["last_action"] = "Oprit manual"
